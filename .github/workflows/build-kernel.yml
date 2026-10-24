@@ -33,37 +33,7 @@ jobs:
           git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git gcc64
           git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9.git gcc32
 
-      - name: Auto-Detect Defconfig & Patch Kernel Name to Star
-        run: |
-          export PATH="$(pwd)/clang/bin:$(pwd)/gcc64/bin:$(pwd)/gcc32/bin:$PATH"
-          export ARCH=arm64
-          export SUBARCH=arm64
-
-          # Localiza automaticamente o defconfig correto no repositório
-          DEFCONFIG=$(find arch/arm64/configs -type f \( -name "*miatoll*defconfig" -o -name "*curtana*defconfig" -o -name "*atoll*defconfig" \) | head -n 1 | sed 's|arch/arm64/configs/||')
-          
-          if [ -z "$DEFCONFIG" ]; then
-            echo "Listando configs disponíveis:"
-            find arch/arm64/configs -type f
-            exit 1
-          fi
-          echo "Usando DEFCONFIG: $DEFCONFIG"
-
-          # Limpa EXTRAVERSION fixo no Makefile se existir
-          sed -i 's/^EXTRAVERSION =.*/EXTRAVERSION = -star/' Makefile
-
-          # Gera o .config inicial
-          make O=out ARCH=arm64 "$DEFCONFIG"
-
-          # Força o nome -star e desativa erros fatais por avisos de compilador (-Werror)
-          ./scripts/config --file out/.config \
-            --set-str LOCALVERSION "-star" \
-            --disable LOCALVERSION_AUTO \
-            --disable WERROR
-
-          make O=out ARCH=arm64 olddefconfig
-
-      - name: Compile Kernel
+      - name: Configure & Compile Star Kernel
         run: |
           export PATH="$(pwd)/clang/bin:$(pwd)/gcc64/bin:$(pwd)/gcc32/bin:$PATH"
           export ARCH=arm64
@@ -71,34 +41,68 @@ jobs:
           export KBUILD_BUILD_USER="Bixcoi"
           export KBUILD_BUILD_HOST="StarBuilder"
 
-          # Tenta compilar com suite LLVM completa; se a árvore exigir gas (GNU as), faz fallback automático
-          make -j$(nproc --all) O=out ARCH=arm64 \
-            CC=clang \
-            LLVM=1 \
-            LLVM_IAS=1 \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
-            CROSS_COMPILE=aarch64-linux-android- \
-            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
-            KCFLAGS="-Wno-error" || \
-          make -j$(nproc --all) O=out ARCH=arm64 \
-            CC=clang \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
-            CROSS_COMPILE=aarch64-linux-android- \
-            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
-            KCFLAGS="-Wno-error"
+          # Define o nome -star diretamente no Makefile
+          sed -i 's/^EXTRAVERSION =.*/EXTRAVERSION = -star/' Makefile
+
+          # 1. Localiza o defconfig BASE completo (mais de 1000 linhas)
+          BASE_DEFCONFIG=""
+          for pattern in "*miatoll*" "*cust*" "*atoll-perf*" "*atoll*" "*sm6250*"; do
+            for f in $(find arch/arm64/configs -type f -name "$pattern"); do
+              LINES=$(wc -l < "$f")
+              if [ "$LINES" -gt 1000 ]; then
+                BASE_DEFCONFIG=$(echo "$f" | sed 's|arch/arm64/configs/||')
+                break 2
+              fi
+            done
+          done
+
+          if [ -z "$BASE_DEFCONFIG" ]; then
+            echo "Erro: Nenhum defconfig completo encontrado!"
+            find arch/arm64/configs -type f -exec wc -l {} +
+            exit 1
+          fi
+          echo ">>> Defconfig Base selecionado: $BASE_DEFCONFIG"
+
+          # Argumentos unificados para evitar que o silentoldconfig reinicie
+          COMMON_ARGS="O=out ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-android- CROSS_COMPILE_ARM32=arm-linux-androideabi-"
+
+          # Gera o .config inicial com as mesmas flags da compilação
+          make $COMMON_ARGS "$BASE_DEFCONFIG"
+
+          # 2. Se existir fragmento específico para miatoll/curtana (< 500 linhas), mescla no .config
+          for frag in $(find arch/arm64/configs -type f \( -name "*miatoll*" -o -name "*curtana*" \)); do
+            LINES=$(wc -l < "$frag")
+            if [ "$LINES" -lt 500 ]; then
+              echo ">>> Mesclando fragmento de dispositivo: $frag"
+              cat "$frag" >> out/.config
+            fi
+          done
+
+          # 3. Garante o nome -star, máscaras de CPU do SM6250 e desativa erros por warning
+          ./scripts/config --file out/.config \
+            --set-str LOCALVERSION "-star" \
+            --disable LOCALVERSION_AUTO \
+            --disable WERROR \
+            --set-val LITTLE_CPU_MASK 63 \
+            --set-val BIG_CPU_MASK 192 \
+            --set-val PRIME_CPU_MASK 0
+
+          # Atualiza a árvore de configuração sem prompts interativos
+          yes "" | make $COMMON_ARGS olddefconfig || make $COMMON_ARGS olddefconfig
+
+          # 4. Compila o Kernel
+          make -j$(nproc --all) $COMMON_ARGS KCFLAGS="-Wno-error"
 
       - name: Configure AnyKernel3 & Package Flashable Zip
         run: |
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
           rm -rf AnyKernel3/.git AnyKernel3/modules AnyKernel3/patch AnyKernel3/ramdisk
 
-          # Configura o anykernel.sh especificamente para Curtana / Miatoll
           sed -i 's/kernel.string=.*/kernel.string=Star Kernel for Redmi Note 9S (Curtana\/Miatoll)/g' AnyKernel3/anykernel.sh
           sed -i 's/do.devicecheck=1/do.devicecheck=0/g' AnyKernel3/anykernel.sh
           sed -i 's|block=.*|block=/dev/block/bootdevice/by-name/boot;|g' AnyKernel3/anykernel.sh
           sed -i 's/is_slot_device=1/is_slot_device=0/g' AnyKernel3/anykernel.sh
 
-          # Copia a imagem compilada do kernel
           if [ -f out/arch/arm64/boot/Image.gz-dtb ]; then
             cp out/arch/arm64/boot/Image.gz-dtb AnyKernel3/
           elif [ -f out/arch/arm64/boot/Image.gz ]; then
@@ -106,11 +110,10 @@ jobs:
           elif [ -f out/arch/arm64/boot/Image ]; then
             cp out/arch/arm64/boot/Image AnyKernel3/
           else
-            echo "Erro: Imagem do kernel não encontrada!"
+            echo "Erro: Imagem compilada não encontrada!"
             exit 1
           fi
 
-          # Copia DTBO e DTB se gerados
           [ -f out/arch/arm64/boot/dtbo.img ] && cp out/arch/arm64/boot/dtbo.img AnyKernel3/
           [ -f out/arch/arm64/boot/dtb.img ] && cp out/arch/arm64/boot/dtb.img AnyKernel3/
 
